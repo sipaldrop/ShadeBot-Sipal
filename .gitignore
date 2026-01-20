@@ -1,0 +1,19 @@
+# Credentials & Config
+accounts.json
+config.json
+tokens.json
+.env
+database.json
+SIPAL_BRANDING_GUIDE.md
+
+# Dependencies
+node_modules/
+package-lock.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# System
+.DS_Store
+Thumbs.db
