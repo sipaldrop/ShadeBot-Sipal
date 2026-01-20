@@ -57,10 +57,13 @@ Before running the bot, ensure you have the following installed:
     cd ShadeBot-Sipal
     ```
 
-2.  **Install Dependencies**
-    ```bash
     npm install
     ```
+
+3.  **Setup Configuration**
+    *   Copy `config_tmp.json` and rename it to `config.json`.
+    *   (Optional) Open `config.json` to adjust endpoints if needed.
+
 
 ---
 
