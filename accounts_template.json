@@ -1,0 +1,7 @@
+[
+    {
+        "privateKey": "YOUR_PRIVATE_KEY",
+        "proxy": "http://user:pass@ip:port",
+        "sessionToken": "YOUR_SESSION_TOKEN_HERE"
+    }
+]

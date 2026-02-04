@@ -1,14 +1,15 @@
 {
-  "name": "shadebot-sipal",
+  "name": "sipal-shade-bot",
   "version": "1.0.0",
-  "description": "",
+  "description": "Sipal Airdrop Community Bot",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Sipal Airdrop",
+  "license": "MIT",
   "type": "commonjs",
   "dependencies": {
     "axios": "^1.13.2",
