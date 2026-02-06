@@ -489,7 +489,7 @@ class ShadeBot {
     async processDailyClaim() {
         this.log(`Checking Daily Claim...`);
 
-        // 1. Check DB
+        // 1. Check DB first (Fast local check)
         const savedQ = db.getQuest(this.walletAddress, 'daily_claim');
         const now = Date.now();
 
@@ -502,11 +502,62 @@ class ShadeBot {
             if (this.stats.minCooldown === null || remaining < this.stats.minCooldown) {
                 this.stats.minCooldown = remaining;
             }
-            this.log(`Daily Claim on cooldown (${Math.floor(remaining / 3600)}h ${Math.floor((remaining % 3600) / 60)}m)`, 'WARN');
+            this.log(`Daily Claim on cooldown (Local DB) (${Math.floor(remaining / 3600)}h ${Math.floor((remaining % 3600) / 60)}m)`, 'WARN');
             return;
         }
 
-        // 2. Execute
+        // 2. Pre-Check: Get User Info to verify 'lastClaimAt'
+        try {
+            let lastClaimAt = null;
+            await this.withRetry('CheckClaimStatus', async () => {
+                const res = await this.client.get('/api/auth/user', {
+                    params: { wallet: this.walletAddress }
+                });
+                if (res.data && res.data.user) {
+                    lastClaimAt = res.data.user.lastClaimAt;
+                }
+            });
+
+            if (lastClaimAt) {
+                const lastClaimDate = new Date(lastClaimAt);
+                const today = new Date();
+
+                // Compare UTC dates
+                const isSameDay =
+                    lastClaimDate.getUTCFullYear() === today.getUTCFullYear() &&
+                    lastClaimDate.getUTCMonth() === today.getUTCMonth() &&
+                    lastClaimDate.getUTCDate() === today.getUTCDate();
+
+                if (isSameDay) {
+                    this.log(`Daily Claim: Already done today (Verified API: ${lastClaimAt})`, 'SUCCESS');
+                    this.stats.daily.status = 'Success';
+
+                    // Set DB Cooldown to Reset Time (Next 00:00 UTC)
+                    const nextReset = new Date();
+                    nextReset.setUTCDate(nextReset.getUTCDate() + 1);
+                    nextReset.setUTCHours(0, 0, 0, 0);
+                    const nextRun = nextReset.getTime();
+
+                    db.updateQuest(this.walletAddress, 'daily_claim', {
+                        title: 'Daily Claim',
+                        category: 'daily',
+                        nextRunTime: nextRun
+                    });
+                    this.stats.daily.nextRun = nextRun;
+
+                    // Update min cooldown
+                    const remaining = Math.ceil((nextRun - now) / 1000);
+                    if (this.stats.minCooldown === null || remaining < this.stats.minCooldown) {
+                        this.stats.minCooldown = remaining;
+                    }
+                    return; // EXIT EARLY
+                }
+            }
+        } catch (e) {
+            this.log(`Failed to check claim status: ${e.message} (Proceeding to try claim anyway)`, 'WARN');
+        }
+
+        // 3. Execute Claim (If not claimed yet)
         try {
             await this.withRetry('DailyClaim', async () => {
                 const res = await this.client.post('/api/claim', {});
