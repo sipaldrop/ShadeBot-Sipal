@@ -487,34 +487,62 @@ class ShadeBot {
     }
 
     async processDailyClaim() {
-        this.log(`Checking Daily Claim...`);
+        this.log(`=== Daily Check-in Start ===`);
 
-        // 1. Check DB first (Fast local check)
-        const savedQ = db.getQuest(this.walletAddress, 'daily_claim');
         const now = Date.now();
 
+        // Helper: Calculate next UTC midnight
+        const getNextUTCMidnight = () => {
+            const next = new Date();
+            next.setUTCDate(next.getUTCDate() + 1);
+            next.setUTCHours(0, 0, 5, 0); // 5 seconds buffer past midnight
+            return next.getTime();
+        };
+
+        // Helper: Set cooldown in DB and stats
+        const setCooldown = (nextRunTime, status = 'Success') => {
+            db.updateQuest(this.walletAddress, 'daily_claim', {
+                title: 'Daily Claim',
+                category: 'daily',
+                nextRunTime: nextRunTime
+            });
+            this.stats.daily.status = status;
+            this.stats.daily.nextRun = nextRunTime;
+            const remaining = Math.ceil((nextRunTime - Date.now()) / 1000);
+            if (remaining > 0 && (this.stats.minCooldown === null || remaining < this.stats.minCooldown)) {
+                this.stats.minCooldown = remaining;
+            }
+        };
+
+        // ========== STEP 1: Local DB cooldown check ==========
+        const savedQ = db.getQuest(this.walletAddress, 'daily_claim');
         if (savedQ && savedQ.nextRunTime > now) {
             const remaining = Math.ceil((savedQ.nextRunTime - now) / 1000);
             this.stats.daily.status = 'Cooldown';
             this.stats.daily.nextRun = savedQ.nextRunTime;
-
-            // Update global min cooldown
             if (this.stats.minCooldown === null || remaining < this.stats.minCooldown) {
                 this.stats.minCooldown = remaining;
             }
-            this.log(`Daily Claim on cooldown (Local DB) (${Math.floor(remaining / 3600)}h ${Math.floor((remaining % 3600) / 60)}m)`, 'WARN');
+            this.log(`Daily Check-in on cooldown (${Math.floor(remaining / 3600)}h ${Math.floor((remaining % 3600) / 60)}m)`, 'WARN');
             return;
         }
 
-        // 2. Pre-Check: Get User Info to verify 'lastClaimAt'
+        // ========== STEP 2: Pre-check via API (lastClaimAt) ==========
+        let shouldAttemptClaim = true;
         try {
             let lastClaimAt = null;
             await this.withRetry('CheckClaimStatus', async () => {
                 const res = await this.client.get('/api/auth/user', {
-                    params: { wallet: this.walletAddress }
+                    params: { wallet: this.walletAddress },
+                    headers: {
+                        ...getHeaders(),
+                        'Referer': `${BASE_URL}/dashboard`,
+                        'Origin': BASE_URL
+                    }
                 });
-                if (res.data && res.data.user) {
+                if (res.data?.user) {
                     lastClaimAt = res.data.user.lastClaimAt;
+                    if (res.data.user.points) this.stats.startPoints = res.data.user.points;
                 }
             });
 
@@ -522,91 +550,158 @@ class ShadeBot {
                 const lastClaimDate = new Date(lastClaimAt);
                 const today = new Date();
 
-                // Compare UTC dates
                 const isSameDay =
                     lastClaimDate.getUTCFullYear() === today.getUTCFullYear() &&
                     lastClaimDate.getUTCMonth() === today.getUTCMonth() &&
                     lastClaimDate.getUTCDate() === today.getUTCDate();
 
                 if (isSameDay) {
-                    this.log(`Daily Claim: Already done today (Verified API: ${lastClaimAt})`, 'SUCCESS');
-                    this.stats.daily.status = 'Success';
-
-                    // Set DB Cooldown to Reset Time (Next 00:00 UTC)
-                    const nextReset = new Date();
-                    nextReset.setUTCDate(nextReset.getUTCDate() + 1);
-                    nextReset.setUTCHours(0, 0, 0, 0);
-                    const nextRun = nextReset.getTime();
-
-                    db.updateQuest(this.walletAddress, 'daily_claim', {
-                        title: 'Daily Claim',
-                        category: 'daily',
-                        nextRunTime: nextRun
-                    });
-                    this.stats.daily.nextRun = nextRun;
-
-                    // Update min cooldown
-                    const remaining = Math.ceil((nextRun - now) / 1000);
-                    if (this.stats.minCooldown === null || remaining < this.stats.minCooldown) {
-                        this.stats.minCooldown = remaining;
-                    }
-                    return; // EXIT EARLY
+                    this.log(`Daily Check-in: Already claimed today (API: ${lastClaimAt})`, 'SUCCESS');
+                    setCooldown(getNextUTCMidnight(), 'Success');
+                    shouldAttemptClaim = false;
                 }
             }
         } catch (e) {
-            this.log(`Failed to check claim status: ${e.message} (Proceeding to try claim anyway)`, 'WARN');
+            this.log(`Pre-check failed: ${e.message} — will try claiming anyway`, 'WARN');
+            // Don't block claim attempt
         }
 
-        // 3. Execute Claim (If not claimed yet)
-        try {
-            await this.withRetry('DailyClaim', async () => {
-                const res = await this.client.post('/api/claim', {});
-                if (res.data.success || res.status === 200) {
-                    this.log(`Daily Claim SUCCESS!`, 'SUCCESS');
-                    if (res.data.reward) this.log(`  > Reward: ${res.data.reward} | Streak: ${res.data.streak}`, 'SUCCESS');
+        if (!shouldAttemptClaim) return;
 
-                    this.stats.daily.status = 'Success';
+        // ========== STEP 3: Execute Daily Claim with multiple strategies ==========
+        let claimSuccess = false;
 
-                    // Set DB Cooldown 24h
-                    const nextRun = Date.now() + (COOLDOWN_DAILY * 1000);
-                    db.updateQuest(this.walletAddress, 'daily_claim', {
-                        title: 'Daily Claim',
-                        category: 'daily',
-                        nextRunTime: nextRun
-                    });
-                    this.stats.daily.nextRun = nextRun;
+        // Strategy A: Direct POST /api/claim (matching HAR exactly)
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                this.log(`Daily Check-in attempt ${attempt}/3...`);
+                const res = await this.client.post('/api/claim', {}, {
+                    headers: {
+                        ...getHeaders(),
+                        'Accept': '*/*',
+                        'Content-Type': 'application/json',
+                        'Referer': `${BASE_URL}/dashboard`,
+                        'Origin': BASE_URL,
+                        'sec-fetch-dest': 'empty',
+                        'sec-fetch-mode': 'cors',
+                        'sec-fetch-site': 'same-origin'
+                    },
+                    timeout: 15000
+                });
 
-                    if (this.stats.minCooldown === null || COOLDOWN_DAILY < this.stats.minCooldown) {
-                        this.stats.minCooldown = COOLDOWN_DAILY;
+                if (res.data?.success || res.status === 200) {
+                    const reward = res.data?.reward || 0;
+                    const streak = res.data?.streak || 0;
+                    const streakBonus = res.data?.streakBonus || 0;
+                    const newPoints = res.data?.newPoints || 0;
+                    this.log(`Daily Check-in SUCCESS! Reward: ${reward} | Streak: ${streak} | Bonus: ${streakBonus} | Total: ${newPoints}`, 'SUCCESS');
+                    setCooldown(getNextUTCMidnight(), 'Success');
+                    claimSuccess = true;
+                    break;
+                }
+            } catch (e) {
+                const status = e.response?.status;
+                const msg = (e.response?.data?.error || e.response?.data?.message || e.message || '').toLowerCase();
+
+                // Already claimed today (400/409/etc) — treat as success
+                if (msg.includes('already') || msg.includes('claimed') || msg.includes('limit') ||
+                    msg.includes('wait') || msg.includes('tomorrow') || status === 400 || status === 409) {
+                    this.log(`Daily Check-in: Already claimed (server: ${msg})`, 'SUCCESS');
+                    setCooldown(getNextUTCMidnight(), 'Success');
+                    claimSuccess = true;
+                    break;
+                }
+
+                // Auth error — don't retry
+                if (status === 401 || status === 403) {
+                    this.log(`Daily Check-in: Auth failed (${status}). Session may be expired.`, 'ERROR');
+                    this.stats.daily.status = 'Failed';
+                    break;
+                }
+
+                // Rate limit — wait and retry
+                if (status === 429) {
+                    this.log(`Daily Check-in: Rate limited. Waiting 30s before retry...`, 'WARN');
+                    await delay(30000);
+                    continue;
+                }
+
+                // Network/server error — retry with backoff
+                this.log(`Daily Check-in attempt ${attempt} failed: ${msg} (status: ${status || 'N/A'})`, 'WARN');
+                if (attempt < 3) {
+                    const waitMs = attempt * 5000 + Math.random() * 3000;
+                    this.log(`Retrying in ${Math.round(waitMs / 1000)}s...`, 'WARN');
+                    await delay(waitMs);
+                }
+            }
+        }
+
+        // Strategy B: If direct claim failed, try via /api/quests/complete + /api/quests/verify pattern
+        if (!claimSuccess) {
+            this.log(`Direct claim failed. Trying alternative quest-based approach...`, 'WARN');
+            try {
+                // Some platforms expose daily claim as a quest
+                const questRes = await this.client.get('/api/quests');
+                const quests = questRes.data?.quests || questRes.data || [];
+                const dailyQuest = quests.find(q =>
+                    q.title?.toLowerCase().includes('daily') ||
+                    q.category === 'daily' ||
+                    q.type === 'daily_claim' ||
+                    q.id === 'daily_claim'
+                );
+
+                if (dailyQuest && !dailyQuest.completed) {
+                    this.log(`Found daily quest: ${dailyQuest.title} (id: ${dailyQuest.id})`);
+                    try { await this.client.post('/api/quests/complete', { questId: dailyQuest.id }); } catch (e) { }
+                    await delay(1000);
+                    try {
+                        const verRes = await this.client.post('/api/quests/verify', { questId: dailyQuest.id });
+                        if (verRes.data?.verified || verRes.data?.success) {
+                            this.log(`Daily Check-in via quest SUCCESS!`, 'SUCCESS');
+                            setCooldown(getNextUTCMidnight(), 'Success');
+                            claimSuccess = true;
+                        }
+                    } catch (e) {
+                        const msg2 = (e.response?.data?.error || e.message || '').toLowerCase();
+                        if (msg2.includes('already') || msg2.includes('completed')) {
+                            this.log(`Daily quest already completed`, 'SUCCESS');
+                            setCooldown(getNextUTCMidnight(), 'Success');
+                            claimSuccess = true;
+                        }
                     }
                 }
-            });
-        } catch (e) {
-            const msg = (e.response?.data?.error || e.message).toLowerCase();
-            const status = e.response?.status;
-
-            // Check for success masquerading as error
-            if (msg.includes('already') || msg.includes('limit') || status === 400) {
-                this.log(`Daily Claim: Already done today.`, 'SUCCESS');
-                this.stats.daily.status = 'Success'; // Mark as success for summary
-
-                // Set DB Cooldown 24h
-                const nextRun = Date.now() + (COOLDOWN_DAILY * 1000);
-                db.updateQuest(this.walletAddress, 'daily_claim', {
-                    title: 'Daily Claim',
-                    category: 'daily',
-                    nextRunTime: nextRun
-                });
-                this.stats.daily.nextRun = nextRun;
-
-                // Update min cooldown logic
-                if (this.stats.minCooldown === null || COOLDOWN_DAILY < this.stats.minCooldown) {
-                    this.stats.minCooldown = COOLDOWN_DAILY;
-                }
-            } else {
-                this.log(`Daily Claim FAILED: ${msg}`, 'ERROR');
-                this.stats.daily.status = 'Failed';
+            } catch (e) {
+                this.log(`Alternative claim approach also failed: ${e.message}`, 'WARN');
             }
+        }
+
+        // ========== STEP 4: Final verification ==========
+        if (claimSuccess) {
+            // Verify claim actually registered by checking user info
+            try {
+                await delay(2000);
+                const verifyRes = await this.client.get('/api/auth/user', {
+                    params: { wallet: this.walletAddress }
+                });
+                if (verifyRes.data?.user) {
+                    const user = verifyRes.data.user;
+                    this.log(`Verified: Points=${user.points} Streak=${user.streak}`, 'SUCCESS');
+                    this.stats.startPoints = user.points;
+                }
+            } catch (e) {
+                // Non-critical, just logging
+            }
+        } else {
+            this.log(`Daily Check-in FAILED after all attempts. Will retry next cycle.`, 'ERROR');
+            this.stats.daily.status = 'Failed';
+            // Set short retry cooldown (5 minutes) so it retries sooner
+            const shortRetry = Date.now() + (5 * 60 * 1000);
+            db.updateQuest(this.walletAddress, 'daily_claim', {
+                title: 'Daily Claim',
+                category: 'daily',
+                nextRunTime: shortRetry
+            });
+            this.stats.daily.nextRun = shortRetry;
         }
     }
 
@@ -1086,6 +1181,11 @@ async function run() {
                 const loggedIn = await bot.login();
 
                 if (loggedIn) {
+                    // === DAILY CHECK-IN (MUST run first) ===
+                    accState.info = 'Daily Check-in...';
+                    await bot.processDailyClaim();
+                    await delay(getRandomDelay());
+
                     accState.info = 'Daily Routine...';
                     await bot.processDailyRoutine();
 
